@@ -206,8 +206,8 @@ struct Settings {
     float shininess        = 48.f;
     // texture
     bool  useTexture       = true;
-    bool  bumpMap          = false;
-    float bumpStrength     = 0.5f;
+    bool  bumpMap          = true;
+    float bumpStrength     = 0.06f;
 };
 
 // ── Texture state ─────────────────────────────────────────────────────────────
