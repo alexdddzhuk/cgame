@@ -1,22 +1,40 @@
 # cgame — 3D OpenGL Cube
 
-A simple 3D OpenGL app written in C++ that renders a rotating colored cube with an ImGui settings panel.
+A GPU-accelerated 3D OpenGL app written in C++ that renders a textured, lit cube with a full ImGui settings panel.
 
 ## Controls
 
 | Input | Action |
 |---|---|
 | `↑ ↓ ← →` | Rotate cube |
+| `LMB drag` | Free rotate (when auto-rotate is off) |
+| `Scroll wheel` | Zoom in / out |
+| `Alt+Enter` | Toggle fullscreen |
 | `ESC` | Quit |
-| `=` button (top-left) | Open / close settings panel |
+| `☰` button (top-left) | Open / close settings panel |
 
 ## Settings Panel
 
-- **Rotation** — manual pitch/yaw sliders + reset
-- **Auto-Rotate** — enable with configurable X/Y speed
-- **Keyboard** — arrow key rotation speed
-- **Display** — wireframe toggle, cube scale, background color
-- **Info** — live FPS counter
+| Section | Options |
+|---|---|
+| **Rotation** | Pitch / Yaw sliders, Reset button |
+| **Auto-Rotate** | D3D-style tumble, configurable X/Y speed; when off — mouse drag + inertia spin |
+| **Display** | Fullscreen toggle, Wireframe, Lighting, Scale, Arrow speed, Mouse sensitivity, Background color |
+| **Texture** | Browse any PNG/JPG/BMP/TGA, Use as bump map, Bump strength slider |
+| **Lighting** | Light direction, Light color, Specular strength, Shininess (Blinn-Phong) |
+| **Camera** | Distance slider + scroll wheel zoom |
+
+## Features
+
+- **Blinn-Phong lighting** — ambient + diffuse + specular highlights
+- **Bump mapping** — derives perturbed normals from the texture's luminance gradient (tangent-space TBN reconstruction)
+- **Mouse inertia** — cube coasts after a flick and gradually decelerates
+- **Scroll zoom** — camera distance 0.5–20 units
+- **Fullscreen** — borderless native resolution via `Alt+Enter` or settings checkbox, restores window on toggle back
+- **Auto-load texture** — drops `texture.png/.jpg/.bmp/.tga` next to the `.exe`; falls back to a built-in checkerboard
+- **Standalone exe** — all libraries statically linked, no DLLs required
+- **FPS counter** — color-coded overlay (green / yellow / red)
+- **Wireframe mode** — clean 12-edge line drawing (no triangle diagonals)
 
 ## Requirements
 
@@ -78,9 +96,10 @@ Only re-run the `cmake -B build ...` configure step when:
 
 | Library | Version | Purpose |
 |---|---|---|
-| [GLFW](https://www.glfw.org/) | 3.4 | Window & input |
+| [GLFW](https://www.glfw.org/) | 3.4 | Window, input & fullscreen |
 | [GLEW](https://glew.sourceforge.net/) | 2.3.1 | OpenGL extension loader |
 | [GLM](https://github.com/g-truc/glm) | 1.0.3 | Math (matrices, vectors) |
 | [Dear ImGui](https://github.com/ocornut/imgui) | 1.92 | Settings UI |
+| [stb_image](https://github.com/nothings/stb) | 2024-07 | PNG/JPG/BMP/TGA texture loading |
 
 All dependencies are statically linked — the final `.exe` is fully self-contained.
