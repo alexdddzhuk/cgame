@@ -12,6 +12,7 @@ find_package(GLEW REQUIRED)
 find_package(glm CONFIG REQUIRED)
 find_package(imgui CONFIG REQUIRED)
 find_package(Stb REQUIRED)
+find_package(assimp CONFIG REQUIRED)
 
 add_executable(cgame WIN32 src/main.cpp)
 
@@ -26,6 +27,7 @@ target_link_libraries(cgame PRIVATE
     GLEW::GLEW
     glm::glm
     imgui::imgui
+    assimp::assimp
 )
 target_include_directories(cgame PRIVATE ${Stb_INCLUDE_DIR})
 

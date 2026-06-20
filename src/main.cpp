@@ -6,13 +6,20 @@
 #include <stb_image.h>
 #include <GL/glew.h>
 #include <GLFW/glfw3.h>
+#define GLFW_EXPOSE_NATIVE_WIN32
+#include <GLFW/glfw3native.h>
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
 #include <imgui.h>
 #include <imgui_impl_glfw.h>
 #include <imgui_impl_opengl3.h>
+#include <assimp/Importer.hpp>
+#include <assimp/scene.h>
+#include <assimp/postprocess.h>
 #include <string>
+#include <vector>
+#include <filesystem>
 #include <iostream>
 
 // ── Shaders ──────────────────────────────────────────────────────────────────
@@ -59,48 +66,67 @@ uniform float     uShininess;
 uniform bool      uUseTexture;
 uniform bool      uBumpMap;
 uniform float     uBumpStrength;
-uniform sampler2D uTexture;
+uniform sampler2D uTexture;     // unit 0 – diffuse
+uniform sampler2D uNormalTex;   // unit 1 – normal map
+uniform bool      uHasNormalTex;
+uniform sampler2D uGlossTex;    // unit 2 – gloss/specular
+uniform bool      uHasGlossTex;
+uniform float     uAmbientStr;
+uniform float     uDiffuseStr;
+uniform sampler2D uMaskTex;    // unit 3 – opacity/alpha mask
+uniform bool      uHasMaskTex;
 
 out vec4 outColor;
 
 void main() {
+    // Alpha mask discard (hair, eyelashes, etc.)
+    if (uHasMaskTex) {
+        float mask = texture(uMaskTex, fragTexCoord).r;
+        if (mask < 0.5) discard;
+    }
     vec3 base = uUseTexture ? texture(uTexture, fragTexCoord).rgb : fragColor;
     if (uLighting) {
         vec3 norm = normalize(fragNormal);
 
-        // Bump mapping: sample height at +U and +V neighbors, build TBN, perturb normal
-        if (uBumpMap && uUseTexture) {
+        // Reconstruct TBN from screen-space derivatives (works for both bump paths)
+        vec3 dp1  = dFdx(fragPos);
+        vec3 dp2  = dFdy(fragPos);
+        vec2 duv1 = dFdx(fragTexCoord);
+        vec2 duv2 = dFdy(fragTexCoord);
+        float det = duv1.x * duv2.y - duv1.y * duv2.x;
+
+        if (uHasNormalTex && abs(det) > 1e-6) {
+            // Real normal map: decode RGB [0,1] -> [-1,1]
+            vec3 n = texture(uNormalTex, fragTexCoord).rgb * 2.0 - 1.0;
+            vec3 T = normalize(( duv2.y * dp1 - duv1.y * dp2) / det);
+            vec3 B = normalize((-duv2.x * dp1 + duv1.x * dp2) / det);
+            norm = normalize(mat3(T, B, norm) * n);
+        } else if (uBumpMap && uUseTexture && abs(det) > 1e-6) {
+            // Height-field bump from diffuse luminance
             float step = 0.004;
             vec3 lumW = vec3(0.299, 0.587, 0.114);
-            float h00 = dot(texture(uTexture, fragTexCoord                     ).rgb, lumW);
-            float h10 = dot(texture(uTexture, fragTexCoord + vec2(step, 0.0)   ).rgb, lumW);
-            float h01 = dot(texture(uTexture, fragTexCoord + vec2(0.0,  step)  ).rgb, lumW);
+            float h00 = dot(texture(uTexture, fragTexCoord                   ).rgb, lumW);
+            float h10 = dot(texture(uTexture, fragTexCoord + vec2(step, 0.0) ).rgb, lumW);
+            float h01 = dot(texture(uTexture, fragTexCoord + vec2(0.0, step) ).rgb, lumW);
             float dhdx = (h10 - h00) / step;
             float dhdy = (h01 - h00) / step;
-
-            // Reconstruct tangent/bitangent from screen-space position + UV derivatives
-            vec3 dp1  = dFdx(fragPos);
-            vec3 dp2  = dFdy(fragPos);
-            vec2 duv1 = dFdx(fragTexCoord);
-            vec2 duv2 = dFdy(fragTexCoord);
-            float det = duv1.x * duv2.y - duv1.y * duv2.x;
-            if (abs(det) > 1e-6) {
-                vec3 T = normalize(( duv2.y * dp1 - duv1.y * dp2) / det);
-                vec3 B = normalize((-duv2.x * dp1 + duv1.x * dp2) / det);
-                norm = normalize(norm + uBumpStrength * (-dhdx * T - dhdy * B));
-            }
+            vec3 T = normalize(( duv2.y * dp1 - duv1.y * dp2) / det);
+            vec3 B = normalize((-duv2.x * dp1 + duv1.x * dp2) / det);
+            norm = normalize(norm + uBumpStrength * (-dhdx * T - dhdy * B));
         }
+
+        float glossVal = uHasGlossTex ? texture(uGlossTex, fragTexCoord).r : 1.0;
 
         vec3  lightDir = normalize(uLightDir);
         float diff     = max(dot(norm, lightDir), 0.0);
-        // Blinn-Phong specular
         vec3  viewDir  = normalize(uCamPos - fragPos);
         vec3  halfDir  = normalize(lightDir + viewDir);
         float spec     = pow(max(dot(norm, halfDir), 0.0), uShininess);
-        vec3  ambient  = 0.18 * base;
-        vec3  diffuse  = diff * uLightColor * base;
-        vec3  specular = uSpecStrength * spec * uLightColor;
-        outColor = vec4(ambient + diffuse + specular, 1.0);
+        vec3  ambient  = uAmbientStr * base;
+        vec3  diffuse  = uDiffuseStr * diff * uLightColor * base;
+        vec3  specular = uSpecStrength * glossVal * spec * uLightColor;
+        vec3  result   = clamp(ambient + diffuse + specular, 0.0, 1.0);
+        outColor = vec4(result, 1.0);
     } else {
         outColor = vec4(base, 1.0);
     }
@@ -202,7 +228,9 @@ struct Settings {
     bool  lighting         = true;
     float lightDir[3]      = { 1.f, 2.f, 2.f };
     float lightColor[3]    = { 1.f, 1.f, 1.f };
-    float specStrength     = 0.55f;
+    float ambientStr       = 0.08f;
+    float diffuseStr       = 0.85f;
+    float specStrength     = 0.3f;
     float shininess        = 48.f;
     // texture
     bool  useTexture       = true;
@@ -215,10 +243,10 @@ struct Settings {
 static GLuint g_texID      = 0;
 static char   g_texPath[512] = "No texture loaded";
 
-static GLuint loadTexture(const char* path)
+static GLuint loadTexture(const char* path, bool flipV = true)
 {
     int w, h, ch;
-    stbi_set_flip_vertically_on_load(true);
+    stbi_set_flip_vertically_on_load(flipV);
     unsigned char* data = stbi_load(path, &w, &h, &ch, 4);
     if (!data) return 0;
 
@@ -320,6 +348,13 @@ static float    g_velY         = 0.f;
 static float    g_dragDX       = 0.f;   // last-frame drag delta (for handoff)
 static float    g_dragDY       = 0.f;
 
+// Middle-button pan
+static bool     g_panning      = false;
+static double   g_panLastX     = 0.0;
+static double   g_panLastY     = 0.0;
+static float    g_panX         = 0.f;   // world-space offset
+static float    g_panY         = 0.f;
+
 // Scroll callback
 static void scrollCallback(GLFWwindow*, double /*xoff*/, double yoff)
 {
@@ -416,6 +451,30 @@ static void processInput(GLFWwindow* w, float dt)
         g_dragging = false;
     }
 
+    // ── Middle-button pan ──
+    if (!io.WantCaptureMouse) {
+        bool mmb = glfwGetMouseButton(w, GLFW_MOUSE_BUTTON_MIDDLE) == GLFW_PRESS;
+        double mx2, my2;
+        glfwGetCursorPos(w, &mx2, &my2);
+        if (mmb) {
+            if (!g_panning) {
+                g_panning  = true;
+                g_panLastX = mx2;
+                g_panLastY = my2;
+            } else {
+                float panSpeed = g_camDist * 0.0015f;
+                g_panX -= (float)(mx2 - g_panLastX) * panSpeed;
+                g_panY += (float)(my2 - g_panLastY) * panSpeed;
+                g_panLastX = mx2;
+                g_panLastY = my2;
+            }
+        } else {
+            g_panning = false;
+        }
+    } else {
+        g_panning = false;
+    }
+
     // ── Apply inertia (exponential decay) ──
     if (!g_dragging) {
         float decay = expf(-4.5f * dt); // ~half-life ≈ 0.15s
@@ -427,6 +486,199 @@ static void processInput(GLFWwindow* w, float dt)
         if (fabsf(g_velX) < 0.1f) g_velX = 0.f;
         if (fabsf(g_velY) < 0.1f) g_velY = 0.f;
     }
+}
+
+// ── Model loading ─────────────────────────────────────────────────────────────
+
+struct ModelMesh {
+    GLuint vao = 0, vbo = 0, ebo = 0;
+    GLuint texID  = 0;   // diffuse
+    GLuint normID = 0;   // normal map
+    GLuint glossID = 0;  // gloss/specular
+    GLuint maskID = 0;   // opacity mask
+    GLsizei indexCount = 0;
+};
+
+static std::vector<ModelMesh> g_meshes;
+static char   g_modelPath[512] = "No model loaded";
+static bool   g_showModel      = false;
+static float  g_modelScale     = 1.f;
+static char   g_modelStatus[1024] = "";
+
+// vertex layout: pos(3) + color/white(3) + normal(3) + uv(2) = 11 floats
+static void freeModel()
+{
+    for (auto& m : g_meshes) {
+        glDeleteVertexArrays(1, &m.vao);
+        glDeleteBuffers(1, &m.vbo);
+        glDeleteBuffers(1, &m.ebo);
+        if (m.texID)   glDeleteTextures(1, &m.texID);
+        if (m.normID)  glDeleteTextures(1, &m.normID);
+        if (m.glossID) glDeleteTextures(1, &m.glossID);
+        if (m.maskID)  glDeleteTextures(1, &m.maskID);
+    }
+    g_meshes.clear();
+}
+
+static bool loadModel(const char* path)
+{
+    Assimp::Importer imp;
+    // Full flags first
+    unsigned int flags = aiProcess_Triangulate | aiProcess_GenSmoothNormals |
+                         aiProcess_FlipUVs     | aiProcess_CalcTangentSpace |
+                         aiProcess_JoinIdenticalVertices;
+    const aiScene* scene = imp.ReadFile(path, flags);
+
+    // Fallback: minimal flags (some FBX/animated files fail CalcTangentSpace)
+    if (!scene || scene->mFlags & AI_SCENE_FLAGS_INCOMPLETE || !scene->mRootNode) {
+        imp.FreeScene();
+        scene = imp.ReadFile(path, aiProcess_Triangulate | aiProcess_FlipUVs |
+                                   aiProcess_JoinIdenticalVertices);
+    }
+
+    if (!scene || !scene->mRootNode || scene->mNumMeshes == 0) {
+        char diagMsg[1200];
+        sprintf_s(diagMsg, sizeof(diagMsg),
+            "Assimp error: \"%s\"\n\nDiag: scene=%s  rootNode=%s  meshes=%u",
+            imp.GetErrorString()[0] ? imp.GetErrorString() : "(no message)",
+            scene ? "yes" : "null",
+            (scene && scene->mRootNode) ? "ok" : "null",
+            scene ? scene->mNumMeshes : 0u);
+        strncpy_s(g_modelStatus, sizeof(g_modelStatus), diagMsg, _TRUNCATE);
+        MessageBoxA(glfwGetWin32Window(g_window), diagMsg, "Model load failed", MB_OK | MB_ICONERROR);
+        return false;
+    }
+
+    freeModel();
+
+    // Compute AABB for auto-scale
+    aiVector3D mn( 1e9f, 1e9f, 1e9f), mx(-1e9f,-1e9f,-1e9f);
+    for (unsigned mi = 0; mi < scene->mNumMeshes; ++mi) {
+        const aiMesh* m = scene->mMeshes[mi];
+        for (unsigned vi = 0; vi < m->mNumVertices; ++vi) {
+            mn.x = std::min(mn.x, m->mVertices[vi].x);
+            mn.y = std::min(mn.y, m->mVertices[vi].y);
+            mn.z = std::min(mn.z, m->mVertices[vi].z);
+            mx.x = std::max(mx.x, m->mVertices[vi].x);
+            mx.y = std::max(mx.y, m->mVertices[vi].y);
+            mx.z = std::max(mx.z, m->mVertices[vi].z);
+        }
+    }
+    float maxDim = std::max({mx.x-mn.x, mx.y-mn.y, mx.z-mn.z});
+    float autoS  = maxDim > 0.f ? 1.8f / maxDim : 1.f;
+    glm::vec3 center((mx.x+mn.x)/2,(mx.y+mn.y)/2,(mx.z+mn.z)/2);
+
+    for (unsigned mi = 0; mi < scene->mNumMeshes; ++mi) {
+        const aiMesh* m = scene->mMeshes[mi];
+        std::vector<float>        verts;
+        std::vector<unsigned int> idxs;
+
+        for (unsigned vi = 0; vi < m->mNumVertices; ++vi) {
+            // position (centered)
+            verts.push_back((m->mVertices[vi].x - center.x) * autoS);
+            verts.push_back((m->mVertices[vi].y - center.y) * autoS);
+            verts.push_back((m->mVertices[vi].z - center.z) * autoS);
+            // color = white
+            verts.push_back(1.f); verts.push_back(1.f); verts.push_back(1.f);
+            // normal
+            if (m->HasNormals()) {
+                verts.push_back(m->mNormals[vi].x);
+                verts.push_back(m->mNormals[vi].y);
+                verts.push_back(m->mNormals[vi].z);
+            } else {
+                verts.push_back(0.f); verts.push_back(1.f); verts.push_back(0.f);
+            }
+            // uv
+            if (m->HasTextureCoords(0)) {
+                verts.push_back(m->mTextureCoords[0][vi].x);
+                verts.push_back(m->mTextureCoords[0][vi].y);
+            } else {
+                verts.push_back(0.f); verts.push_back(0.f);
+            }
+        }
+        for (unsigned fi = 0; fi < m->mNumFaces; ++fi) {
+            const aiFace& face = m->mFaces[fi];
+            for (unsigned ii = 0; ii < face.mNumIndices; ++ii)
+                idxs.push_back(face.mIndices[ii]);
+        }
+
+        ModelMesh mesh;
+        mesh.indexCount = (GLsizei)idxs.size();
+        glGenVertexArrays(1, &mesh.vao);
+        glGenBuffers(1, &mesh.vbo);
+        glGenBuffers(1, &mesh.ebo);
+        glBindVertexArray(mesh.vao);
+        glBindBuffer(GL_ARRAY_BUFFER, mesh.vbo);
+        glBufferData(GL_ARRAY_BUFFER, verts.size()*sizeof(float), verts.data(), GL_STATIC_DRAW);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, mesh.ebo);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, idxs.size()*sizeof(unsigned int), idxs.data(), GL_STATIC_DRAW);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 11*sizeof(float), (void*)0);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 11*sizeof(float), (void*)(3*sizeof(float)));
+        glEnableVertexAttribArray(1);
+        glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, 11*sizeof(float), (void*)(6*sizeof(float)));
+        glEnableVertexAttribArray(2);
+        glVertexAttribPointer(3, 2, GL_FLOAT, GL_FALSE, 11*sizeof(float), (void*)(9*sizeof(float)));
+        glEnableVertexAttribArray(3);
+        glBindVertexArray(0);
+
+        // Load diffuse, normal map, gloss textures for this mesh
+        mesh.texID = mesh.normID = mesh.glossID = 0;
+        if (m->mMaterialIndex < scene->mNumMaterials) {
+            const aiMaterial* mat = scene->mMaterials[m->mMaterialIndex];
+            namespace fs = std::filesystem;
+            fs::path base = fs::path(path).parent_path();
+
+            auto resolveTex = [&](aiTextureType type) -> GLuint {
+                aiString rel;
+                if (mat->GetTexture(type, 0, &rel) != AI_SUCCESS) return 0;
+                fs::path full = (base / rel.C_Str()).lexically_normal();
+                GLuint id = loadTexture(full.string().c_str(), false);
+                if (!id) {
+                    fs::path alt = (base / "tex" / fs::path(rel.C_Str()).filename()).lexically_normal();
+                    id = loadTexture(alt.string().c_str(), false);
+                }
+                return id;
+            };
+
+            mesh.texID  = resolveTex(aiTextureType_DIFFUSE);
+            mesh.normID = resolveTex(aiTextureType_NORMALS);
+            if (!mesh.normID) mesh.normID = resolveTex(aiTextureType_HEIGHT);
+            mesh.glossID = resolveTex(aiTextureType_SHININESS);
+            if (!mesh.glossID) mesh.glossID = resolveTex(aiTextureType_SPECULAR);
+            mesh.maskID = resolveTex(aiTextureType_OPACITY);
+        }
+
+        g_meshes.push_back(mesh);
+    }
+
+    strncpy_s(g_modelPath, path, sizeof(g_modelPath)-1);
+    sprintf_s(g_modelStatus, sizeof(g_modelStatus), "OK: %u mesh(es)", scene->mNumMeshes);
+
+    // Reset view state on new model load
+    g_rotX = 0.f;  g_rotY = 0.f;
+    g_velX = 0.f;  g_velY = 0.f;
+    g_panX = 0.f;  g_panY = 0.f;
+    g_camDist = 3.f;
+    g_set.autoRotate = false;
+
+    return true;
+}
+
+static void browseModel()
+{
+    char path[512] = {};
+    OPENFILENAMEA ofn = {};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner   = glfwGetWin32Window(g_window);
+    ofn.lpstrFilter = "3D Models\0*.obj;*.fbx;*.3ds;*.gltf;*.glb;*.dae;*.ply;*.stl\0All Files\0*.*\0";
+    ofn.lpstrFile   = path;
+    ofn.nMaxFile    = sizeof(path);
+    ofn.Flags       = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER;
+    ofn.lpstrTitle  = "Open 3D Model";
+    if (!GetOpenFileNameA(&ofn)) return;
+    loadModel(path);
+    if (!g_meshes.empty()) g_showModel = true;
 }
 
 // ── UI helpers ────────────────────────────────────────────────────────────────
@@ -499,6 +751,59 @@ static void drawUI(int winW, int winH)
         ImGui::PopStyleVar(2);
     }
 
+    // ── Light controls overlay (bottom-right, always visible) ────────────────
+    {
+        const float PAD = 10.f;
+        ImGui::SetNextWindowPos(ImVec2((float)winW - PAD, (float)winH - PAD),
+                                ImGuiCond_Always, ImVec2(1.f, 1.f));
+        ImGui::SetNextWindowSize(ImVec2(240, 0), ImGuiCond_Always);
+        ImGui::SetNextWindowBgAlpha(0.78f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10, 8));
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,   ImVec2(6, 5));
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 3.f);
+        ImGui::Begin("##lightbar", nullptr,
+            ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+            ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav |
+            ImGuiWindowFlags_AlwaysAutoResize);
+
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f,0.85f,1.f,1.f));
+        ImGui::TextUnformatted("Lighting");
+        ImGui::PopStyleColor();
+        ImGui::SameLine(0, 8);
+        ImGui::Checkbox("##liton", &g_set.lighting);
+        ImGui::SameLine(0, 12);
+        ImGui::Checkbox("Wire##wfov", &g_set.wireframe);
+
+        ImGui::BeginDisabled(!g_set.lighting);
+        ImGui::SetNextItemWidth(-1);
+        ImGui::SliderFloat3("##ld", g_set.lightDir, -5.f, 5.f, "Dir %.1f");
+        ImGui::SetNextItemWidth(-1);
+        ImGui::ColorEdit3("##lc", g_set.lightColor,
+            ImGuiColorEditFlags_NoLabel | ImGuiColorEditFlags_NoAlpha);
+        ImGui::SameLine(0,4);
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.7f,0.7f,0.7f,1.f));
+        ImGui::TextUnformatted("Color");
+        ImGui::PopStyleColor();
+        ImGui::SetNextItemWidth(-1);
+        ImGui::SliderFloat("##amb", &g_set.ambientStr,  0.f, 1.f,   "Ambient %.2f");
+        ImGui::SetNextItemWidth(-1);
+        ImGui::SliderFloat("##dif", &g_set.diffuseStr,  0.f, 1.f,   "Diffuse %.2f");
+        ImGui::SetNextItemWidth(-1);
+        ImGui::SliderFloat("##sp",  &g_set.specStrength, 0.f, 1.f,  "Spec    %.2f");
+        ImGui::SetNextItemWidth(-1);
+        ImGui::SliderFloat("##sh",  &g_set.shininess,    2.f, 256.f, "Shin    %.0f");
+        if (ImGui::Button("Reset light", ImVec2(-1, 0))) {
+            g_set.lightDir[0]=1.f; g_set.lightDir[1]=2.f; g_set.lightDir[2]=2.f;
+            g_set.lightColor[0]=g_set.lightColor[1]=g_set.lightColor[2]=1.f;
+            g_set.ambientStr=0.08f; g_set.diffuseStr=0.85f;
+            g_set.specStrength=0.3f; g_set.shininess=48.f;
+        }
+        ImGui::EndDisabled();
+
+        ImGui::End();
+        ImGui::PopStyleVar(3);
+    }
+
     if (!g_showSettings) return;
 
     // ── Settings panel ────────────────────────────────────────────────────────
@@ -559,6 +864,47 @@ static void drawUI(int winW, int winH)
     ImGui::Spacing();
     ImGui::ColorEdit3("Background", g_set.bgColor);
 
+    // ── Model ──
+    Section("  3D Model");
+    if (ImGui::Button("Browse model...", ImVec2(-1,0)))
+        browseModel();
+    ImGui::Spacing();
+    {
+        const char* disp = g_modelPath;
+        int len = (int)strlen(disp);
+        if (len > 34) disp += (len - 34);
+        ImVec4 col = g_meshes.empty() ? ImVec4(0.6f,0.6f,0.6f,1.f) : ImVec4(0.5f,0.9f,0.5f,1.f);
+        ImGui::PushStyleColor(ImGuiCol_Text, col);
+        ImGui::TextUnformatted(disp);
+        ImGui::PopStyleColor();
+        if (g_modelStatus[0]) {
+            bool isErr = g_meshes.empty();
+            ImVec4 scol = isErr ? ImVec4(1.f,0.35f,0.35f,1.f) : ImVec4(0.4f,0.9f,0.4f,1.f);
+            ImGui::PushStyleColor(ImGuiCol_Text, scol);
+            if (isErr) {
+                // Scrollable error box so the full message is readable
+                ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.15f,0.05f,0.05f,1.f));
+                ImGui::BeginChild("##errmsg", ImVec2(-1, 80), true);
+                ImGui::TextWrapped("%s", g_modelStatus);
+                ImGui::EndChild();
+                ImGui::PopStyleColor();
+            } else {
+                ImGui::TextUnformatted(g_modelStatus);
+            }
+            ImGui::PopStyleColor();
+        }
+    }
+    ImGui::BeginDisabled(g_meshes.empty());
+    ImGui::Checkbox("Show model (instead of cube)", &g_showModel);
+    ImGui::SetNextItemWidth(-1);
+    ImGui::SliderFloat("##mscale", &g_modelScale, 0.1f, 5.f, "Scale  %.2f");
+    if (ImGui::Button("Reset model scale", ImVec2(-1,0))) g_modelScale = 1.f;
+    ImGui::EndDisabled();
+    ImGui::Spacing();
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.5f,0.5f,0.5f,1.f));
+    ImGui::TextUnformatted("OBJ  FBX  3DS  GLTF  DAE  PLY  STL");
+    ImGui::PopStyleColor();
+
     // ── Texture ──
     Section("  Texture");
     ImGui::Checkbox("Use texture##tex", &g_set.useTexture);
@@ -590,19 +936,6 @@ static void drawUI(int winW, int winH)
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.5f,0.5f,0.5f,1.f));
     ImGui::TextUnformatted("Uses luminance of texture as height field");
     ImGui::PopStyleColor();
-
-    // ── Lighting ──
-    ImGui::BeginDisabled(!g_set.lighting);
-    Section("  Lighting");
-    ImGui::SetNextItemWidth(-1);
-    ImGui::SliderFloat3("##ldir", g_set.lightDir, -5.f, 5.f, "Dir  %.1f");
-    ImGui::ColorEdit3("Light color", g_set.lightColor);
-    ImGui::Spacing();
-    ImGui::SetNextItemWidth(-1);
-    ImGui::SliderFloat("##spec",  &g_set.specStrength, 0.f, 1.f,   "Specular  %.2f");
-    ImGui::SetNextItemWidth(-1);
-    ImGui::SliderFloat("##shin",  &g_set.shininess,    2.f, 256.f, "Shininess %.0f");
-    ImGui::EndDisabled();
 
     // ── Camera ──
     Section("  Camera");
@@ -648,6 +981,7 @@ int main()
     // ImGui setup
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
+    ImGui::GetIO().IniFilename = nullptr;  // disable imgui.ini
     ImGui::StyleColorsDark();
     ImGui::GetStyle().WindowRounding = 6.f;
     ImGui_ImplGlfw_InitForOpenGL(window, true);
@@ -710,10 +1044,24 @@ int main()
     GLint uBumpMap     = glGetUniformLocation(prog, "uBumpMap");
     GLint uBumpStr     = glGetUniformLocation(prog, "uBumpStrength");
     GLint uTexture     = glGetUniformLocation(prog, "uTexture");
+    GLint uNormalTex   = glGetUniformLocation(prog, "uNormalTex");
+    GLint uHasNormTex  = glGetUniformLocation(prog, "uHasNormalTex");
+    GLint uGlossTex    = glGetUniformLocation(prog, "uGlossTex");
+    GLint uHasGlossTex = glGetUniformLocation(prog, "uHasGlossTex");
+    GLint uMaskTex     = glGetUniformLocation(prog, "uMaskTex");
+    GLint uHasMaskTex  = glGetUniformLocation(prog, "uHasMaskTex");
+    GLint uAmbientStr  = glGetUniformLocation(prog, "uAmbientStr");
+    GLint uDiffuseStr  = glGetUniformLocation(prog, "uDiffuseStr");
 
-    // Bind texture unit 0
+    // Bind texture units
     glUseProgram(prog);
-    glUniform1i(uTexture, 0);
+    glUniform1i(uTexture,   0);
+    glUniform1i(uNormalTex, 1);
+    glUniform1i(uGlossTex,  2);
+    glUniform1i(uMaskTex,   3);
+
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
     // Auto-load texture from exe dir (or fallback checkerboard)
     autoLoadTexture();
@@ -745,16 +1093,19 @@ int main()
         glUseProgram(prog);
 
         // Model: scale, then X/Y rotation
+        bool drawingModel = g_showModel && !g_meshes.empty();
         glm::mat4 model = glm::mat4(1.f);
-        model = glm::scale(model, glm::vec3(g_set.cubeScale));
+        model = glm::scale(model, glm::vec3(drawingModel ? g_modelScale : g_set.cubeScale));
         model = glm::rotate(model, glm::radians(g_rotX), glm::vec3(1.f, 0.f, 0.f));
         model = glm::rotate(model, glm::radians(g_rotY), glm::vec3(0.f, 1.f, 0.f));
 
-        // View: camera at g_camDist
-        glm::vec3 camPos(0.f, 0.f, g_camDist);
+        // View: camera at g_camDist + pan offset
+        glm::vec3 panOffset(g_panX, g_panY, 0.f);
+        glm::vec3 camPos = glm::vec3(0.f, 0.f, g_camDist) + panOffset;
+        glm::vec3 camTarget = panOffset;
         glm::mat4 view = glm::lookAt(
             camPos,
-            glm::vec3(0.f, 0.f, 0.f),
+            camTarget,
             glm::vec3(0.f, 1.f, 0.f)
         );
 
@@ -774,17 +1125,52 @@ int main()
         glUniform3f(uCamPos,     camPos.x, camPos.y, camPos.z);
         glUniform1f(uSpecStr,    g_set.specStrength);
         glUniform1f(uShininess,  g_set.shininess);
+        glUniform1f(uAmbientStr, g_set.ambientStr);
+        glUniform1f(uDiffuseStr, g_set.diffuseStr);
 
-        bool texNow = g_set.useTexture && g_texID && !g_set.wireframe;
+        // Don't apply cube texture to models
+        bool texNow = !drawingModel && g_set.useTexture && g_texID && !g_set.wireframe;
         glUniform1i(uUseTexture, texNow ? 1 : 0);
         glUniform1i(uBumpMap,    (texNow && g_set.bumpMap) ? 1 : 0);
         glUniform1f(uBumpStr,    g_set.bumpStrength);
+        glUniform1i(uHasNormTex,  0);
+        glUniform1i(uHasGlossTex, 0);
+        glUniform1i(uHasMaskTex,  0);
         if (texNow) {
             glActiveTexture(GL_TEXTURE0);
             glBindTexture(GL_TEXTURE_2D, g_texID);
         }
 
-        if (g_set.wireframe) {
+        if (drawingModel) {
+            // Draw loaded model meshes — bind per-mesh diffuse + normal + gloss
+            for (auto& m : g_meshes) {
+                // diffuse
+                glActiveTexture(GL_TEXTURE0);
+                glBindTexture(GL_TEXTURE_2D, m.texID ? m.texID : 0);
+                glUniform1i(uUseTexture, m.texID ? 1 : 0);
+                glUniform1i(uBumpMap, 0);
+                // normal map
+                glActiveTexture(GL_TEXTURE1);
+                glBindTexture(GL_TEXTURE_2D, m.normID ? m.normID : 0);
+                glUniform1i(uHasNormTex, m.normID ? 1 : 0);
+                // gloss
+                glActiveTexture(GL_TEXTURE2);
+                glBindTexture(GL_TEXTURE_2D, m.glossID ? m.glossID : 0);
+                glUniform1i(uHasGlossTex, m.glossID ? 1 : 0);
+                // opacity mask
+                glActiveTexture(GL_TEXTURE3);
+                glBindTexture(GL_TEXTURE_2D, m.maskID ? m.maskID : 0);
+                glUniform1i(uHasMaskTex, m.maskID ? 1 : 0);
+
+                glBindVertexArray(m.vao);
+                glDrawElements(GL_TRIANGLES, m.indexCount, GL_UNSIGNED_INT, nullptr);
+            }
+            // Reset extra units
+            glActiveTexture(GL_TEXTURE3); glBindTexture(GL_TEXTURE_2D, 0);
+            glActiveTexture(GL_TEXTURE2); glBindTexture(GL_TEXTURE_2D, 0);
+            glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, 0);
+            glActiveTexture(GL_TEXTURE0);
+        } else if (g_set.wireframe) {
             glBindVertexArray(VAO_wire);
             glDrawElements(GL_LINES, 24, GL_UNSIGNED_INT, nullptr);
         } else {
@@ -804,6 +1190,7 @@ int main()
     ImGui::DestroyContext();
 
     if (g_texID) glDeleteTextures(1, &g_texID);
+    freeModel();
     glDeleteVertexArrays(1, &VAO);
     glDeleteVertexArrays(1, &VAO_wire);
     glDeleteBuffers(1, &VBO);
