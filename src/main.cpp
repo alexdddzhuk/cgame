@@ -573,13 +573,22 @@ static bool loadModel(const char* path)
         std::vector<float>        verts;
         std::vector<unsigned int> idxs;
 
+        // Read material diffuse color (used when no texture is present)
+        float matR = 1.f, matG = 1.f, matB = 1.f;
+        if (m->mMaterialIndex < scene->mNumMaterials) {
+            aiColor4D kd;
+            if (scene->mMaterials[m->mMaterialIndex]->Get(AI_MATKEY_COLOR_DIFFUSE, kd) == AI_SUCCESS) {
+                matR = kd.r; matG = kd.g; matB = kd.b;
+            }
+        }
+
         for (unsigned vi = 0; vi < m->mNumVertices; ++vi) {
             // position (centered)
             verts.push_back((m->mVertices[vi].x - center.x) * autoS);
             verts.push_back((m->mVertices[vi].y - center.y) * autoS);
             verts.push_back((m->mVertices[vi].z - center.z) * autoS);
-            // color = white
-            verts.push_back(1.f); verts.push_back(1.f); verts.push_back(1.f);
+            // color from material Kd (fallback white)
+            verts.push_back(matR); verts.push_back(matG); verts.push_back(matB);
             // normal
             if (m->HasNormals()) {
                 verts.push_back(m->mNormals[vi].x);
